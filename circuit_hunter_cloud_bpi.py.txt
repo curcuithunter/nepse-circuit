@@ -1,0 +1,107 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import requests
+from streamlit_autorefresh import st_autorefresh
+
+# Page config
+st.set_page_config(page_title="NEPSE Circuit Hunter", layout="wide")
+st.title("📈 NEPSE Circuit Hunter with Buy Pressure Index (BPI)")
+
+# Auto-refresh every 60 sec
+st_autorefresh(interval=60 * 1000, key="refresh")
+
+# Sidebar settings
+gap_threshold = st.sidebar.slider("Max % gap to circuit", 0.5, 5.0, 1.0, 0.1)
+bpi_threshold = st.sidebar.slider("BPI threshold (%)", 50, 100, 70, 1)
+top_n = st.sidebar.number_input("Top N results", 5, 50, 15)
+
+sort_mode = st.sidebar.radio(
+    "Sort Upper Circuit Candidates By",
+    ("Highest BPI", "Closest to Upper Circuit")
+)
+
+# Fetch NEPSE live prices
+@st.cache_data(ttl=55)
+def get_live_prices():
+    url = "https://www.nepalstock.com/api/nots/nepse-data/todays-price"
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+    if r.status_code != 200:
+        st.error("Error fetching live prices from NEPSE API.")
+        return pd.DataFrame()
+    data = r.json().get("floorsheet", [])
+    return pd.DataFrame(data)
+
+# Fetch order book depth
+@st.cache_data(ttl=55)
+def get_order_book(security_id):
+    url = f"https://www.nepalstock.com/api/nots/nepse-data/market-depth/{security_id}"
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+    if r.status_code != 200:
+        return None, None
+    data = r.json()
+    buy_orders = data.get("buy", [])
+    sell_orders = data.get("sell", [])
+    buy_vol = sum(o.get("quantity", 0) for o in buy_orders)
+    sell_vol = sum(o.get("quantity", 0) for o in sell_orders)
+    return buy_vol, sell_vol
+
+# Get live prices
+prices_df = get_live_prices()
+
+if not prices_df.empty:
+    # Ensure numeric types
+    prices_df["lastTradedPrice"] = pd.to_numeric(prices_df["lastTradedPrice"], errors="coerce")
+    prices_df["maxPrice"] = pd.to_numeric(prices_df["maxPrice"], errors="coerce")
+    prices_df["minPrice"] = pd.to_numeric(prices_df["minPrice"], errors="coerce")
+
+    # Calculate % gaps
+    prices_df["gap_to_upper"] = ((prices_df["maxPrice"] - prices_df["lastTradedPrice"]) / prices_df["maxPrice"]) * 100
+    prices_df["gap_to_lower"] = ((prices_df["lastTradedPrice"] - prices_df["minPrice"]) / prices_df["minPrice"]) * 100
+
+    # Fetch BPI for each stock
+    bpi_list = []
+    for _, row in prices_df.iterrows():
+        buy_vol, sell_vol = get_order_book(row["securityId"])
+        if buy_vol is None:
+            bpi_list.append(np.nan)
+        else:
+            total_vol = buy_vol + sell_vol
+            bpi = (buy_vol / total_vol * 100) if total_vol > 0 else 0
+            bpi_list.append(bpi)
+    prices_df["BPI"] = bpi_list
+
+    # Filter candidates (upper + lower)
+    candidates = prices_df[
+        (prices_df["gap_to_upper"] <= gap_threshold) |
+        (prices_df["gap_to_lower"] <= gap_threshold)
+    ].copy()
+
+    # Apply sorting for upper circuit candidates only
+    if sort_mode == "Highest BPI":
+        candidates.sort_values(
+            by=["gap_to_upper", "BPI"], ascending=[True, False], inplace=True
+        )
+        candidates.sort_values(
+            by="BPI", ascending=False, inplace=True
+        )
+    elif sort_mode == "Closest to Upper Circuit":
+        candidates.sort_values(by="gap_to_upper", ascending=True, inplace=True)
+
+    # Styling
+    def highlight_row(row):
+        if row["gap_to_upper"] <= gap_threshold and row["BPI"] >= bpi_threshold:
+            return ["background-color: lightgreen"] * len(row)
+        elif row["gap_to_lower"] <= gap_threshold and (100 - row["BPI"]) >= bpi_threshold:
+            return ["background-color: lightcoral"] * len(row)
+        else:
+            return [""] * len(row)
+
+    show_cols = ["symbol", "lastTradedPrice", "maxPrice", "minPrice",
+                 "gap_to_upper", "gap_to_lower", "BPI"]
+
+    st.dataframe(
+        candidates[show_cols].head(top_n).style.apply(highlight_row, axis=1)
+    )
+else:
+    st.warning("No live data available right now.")
